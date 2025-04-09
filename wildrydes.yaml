@@ -1,0 +1,287 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  RepositoryName:
+    Type: String
+    Description: "The name of the GitHub repository"
+    Default: "your-repository-name"  # Replace with the default repo name or leave blank
+
+Resources:
+  # S3 Bucket for Pipeline Artifacts
+  PipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-artifact-bucket"
+
+  # IAM Role for CodeBuild
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 'sts:AssumeRole'
+            Principal:
+              Service: 'codebuild.amazonaws.com'
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:PutImage'
+                  - 'codebuild:BatchGetBuilds'
+                Resource: '*'
+
+  # IAM Role for CodePipeline
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 'sts:AssumeRole'
+            Principal:
+              Service: 'codepipeline.amazonaws.com'
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 'codebuild:StartBuild'
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                Resource: '*'
+
+  # CodeBuild Project
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "aagam2900-${RepositoryName}-build"
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+        Name: build-output
+      Source:
+        Type: GITHUB
+        Location: !Sub "https://github.com/aagam2900/${RepositoryName}.git"
+        GitCloneDepth: 1
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                docker: 19
+            build:
+              commands:
+                - echo Build started on `date`
+                - docker build -t myimage .
+                - docker push myimage
+        Configuration:
+          OAuthToken: !Ref GitHubOAuthToken
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:4.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: IMAGE_TAG
+            Value: !Ref ImageTag
+      TimeoutInMinutes: 60
+
+  # GitHub OAuth Token (sensitive information)
+  GitHubOAuthToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: GitHubOAuthToken
+      Description: OAuth token for GitHub access
+      SecretString: !Sub '{"OAuthToken": "your-github-oauth-token"}'
+
+  # CodeDeploy Role
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 'sts:AssumeRole'
+            Principal:
+              Service: 'codedeploy.amazonaws.com'
+      Policies:
+        - PolicyName: CodeDeployPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecs:UpdateService'
+                  - 'ecs:DescribeServices'
+                  - 'ecs:DescribeTaskDefinition'
+                  - 'ecs:ListTasks'
+                  - 'codedeploy:CreateDeployment'
+                Resource: '*'
+
+  # CodeDeploy Application
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ComputePlatform: ECS
+
+  # CodeDeploy Deployment Group
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      ServiceRole: !GetAtt CodeDeployRole.Arn
+      DeploymentGroupName: !Sub "aagam2900-${RepositoryName}-deployment-group"
+      ECSService:
+        ClusterName: !Ref ECSCluster
+        ServiceName: !Ref ECSService
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "aagam2900-${RepositoryName}-cluster"
+
+  # ECS Task Definition
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "aagam2900-${RepositoryName}-task"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ContainerDefinitions:
+        - Name: !Sub "aagam2900-${RepositoryName}-container"
+          Image: !Sub "your-account-id.dkr.ecr.us-west-2.amazonaws.com/${RepositoryName}:latest"
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+              Protocol: tcp
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      DesiredCount: 2
+      LaunchType: FARGATE
+      TaskDefinition: !Ref ECSTaskDefinition
+      LoadBalancers:
+        - ContainerName: !Sub "aagam2900-${RepositoryName}-container"
+          ContainerPort: 80
+          TargetGroupArn: !Ref TargetGroup
+
+  # Application Load Balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "aagam2900-${RepositoryName}-loadbalancer"
+      Subnets:
+        - Ref: Subnet1
+        - Ref: Subnet2
+      SecurityGroups:
+        - Ref: SecurityGroup
+
+  # Target Group for Load Balancer
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "aagam2900-${RepositoryName}-target-group"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+
+  # CodePipeline
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "aagam2900-${RepositoryName}-pipeline"
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: '1'
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                Owner: aagam2900
+                Repo: !Ref RepositoryName
+                Branch: main
+                OAuthToken: !Ref GitHubOAuthToken
+        - Name: Build
+          Actions:
+            - Name: CodeBuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+        - Name: Deploy
+          Actions:
+            - Name: CodeDeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: '1'
+              InputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref CodeDeployDeploymentGroup
+
+  # CloudWatch Alarm for CodePipeline Failures
+  CodePipelineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "aagam2900-${RepositoryName}-pipeline-failure"
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: '1'
+      MetricName: Failed
+      Namespace: AWS/CodePipeline
+      Period: '60'
+      Statistic: Sum
+      Threshold: '1'
+      Dimensions:
+        - Name: PipelineName
+          Value: !Ref CodePipeline
+      AlarmActions:
+        - !Ref AlarmSNS
+
+  # SNS Topic for Alarm Notifications
+  AlarmSNS:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: PipelineFailureNotifications
+      TopicName: !Sub "aagam2900-${RepositoryName}-pipeline-failure-topic"
